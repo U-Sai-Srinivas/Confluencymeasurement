@@ -17,12 +17,6 @@ VALID_EXT = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
 # ----------------------------- Core image processing (pure, no I/O) -----------------------------
 
 def correct_background(gray, kernel_frac=0.05, cells_darker=True):
-    """Remove uneven illumination using a large-kernel morphological
-    opening/closing (estimated background), then subtract it so cells always
-    end up as BRIGHT blobs on a near-zero background, regardless of whether
-    cells are naturally darker or brighter than the background.
-    kernel_frac scales the kernel size to image size so it works across
-    resolutions."""
     h, w = gray.shape
     k = max(15, int(min(h, w) * kernel_frac))
     if k % 2 == 0:
@@ -47,10 +41,6 @@ def enhance_contrast(gray, clip_limit=2.0, tile_grid=8):
 
 def segment_cells(gray, min_object_px=50, close_kernel=5, use_adaptive=False,
                    adaptive_block=51, adaptive_c=2):
-    """Threshold + clean up morphology. Input `gray` is assumed to already be
-    background-corrected such that cells are BRIGHT on a near-zero
-    background (see correct_background). Returns binary mask (0/255) where
-    255 = cell/foreground."""
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
     if use_adaptive:
@@ -91,7 +81,6 @@ def make_overlay(original_bgr, mask, color=(0, 255, 0), alpha=0.4):
 
 
 def process_image_array(raw, params):
-    """Runs the full pipeline on an already-decoded BGR image array."""
     gray = cv2.cvtColor(raw, cv2.COLOR_BGR2GRAY)
 
     corrected, _ = correct_background(gray, kernel_frac=params["bg_kernel_frac"], cells_darker=params["invert"])
@@ -128,11 +117,6 @@ def process_image_from_bytes(file_bytes, params):
 
 
 def score_segmentation(gray_enhanced, mask):
-    """Unsupervised quality proxy — there's no ground truth to compare against,
-    so this rewards a segmentation that (a) isn't degenerate (~0% or ~100%
-    foreground), (b) isn't fragmented into lots of tiny speckle objects, and
-    (c) has mask boundaries that sit on genuinely high-contrast edges in the
-    image rather than falling on flat, arbitrary regions. Higher is better."""
     total = mask.size
     fg = np.count_nonzero(mask)
     conf = 100.0 * fg / total
@@ -168,7 +152,6 @@ def _decode_path(path):
 
 
 def get_sample_images(source_mode, uploaded_files, folder, max_n=3):
-    """Returns up to max_n (name, raw_bgr_array) pairs for preview/auto-tune, without touching disk output."""
     samples = []
     if source_mode == "Upload images" and uploaded_files:
         for uf in uploaded_files[:max_n]:
@@ -184,31 +167,58 @@ def get_sample_images(source_mode, uploaded_files, folder, max_n=3):
     return samples
 
 
-def auto_suggest_params(sample_images, base_params):
-    """Small grid search over the parameters that most affect segmentation
-    quality, scored with score_segmentation() and averaged across sample
-    images. Keeps 'invert' and 'use_adaptive' as the user set them, since
-    those reflect known facts about the imaging modality, not something to
-    guess blindly."""
+AUTO_TUNE_MAX_DIM = 480  # px — search runs on a downsampled copy so it stays fast regardless of source resolution
+
+
+def _downsample_for_tuning(raw, max_dim=AUTO_TUNE_MAX_DIM):
+    h, w = raw.shape[:2]
+    scale = min(1.0, max_dim / max(h, w))
+    if scale >= 1.0:
+        return raw
+    return cv2.resize(raw, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
+
+
+def auto_suggest_params(sample_images, base_params, progress_cb=None):
+    """Runs entirely on downsampled copies (<= AUTO_TUNE_MAX_DIM per side) so it
+    stays fast even on full-resolution microscopy scans. The morphology kernel
+    size is searched as a fraction of image size, then translated back to an
+    absolute pixel size for the caller's actual (full-resolution) images."""
     bg_kernel_fracs = [0.05, 0.08, 0.12, 0.18]
     clahe_clips = [1.5, 2.0, 3.0]
-    morph_kernels = [3, 5, 7]
+    morph_kernel_fracs = [0.010, 0.020, 0.035]
 
-    best_score, best_combo, best_info = None, None, None
-    for bgf in bg_kernel_fracs:
-        for clip in clahe_clips:
-            for mk in morph_kernels:
-                trial_params = dict(base_params, bg_kernel_frac=bgf, clahe_clip=clip, morph_kernel=mk)
-                scores, infos = [], []
-                for _, raw in sample_images:
-                    res = process_image_array(raw, trial_params)
-                    s, info = score_segmentation(res["enhanced"], res["mask"])
-                    scores.append(s)
-                    infos.append(info)
-                avg_score = sum(scores) / len(scores)
-                if best_score is None or avg_score > best_score:
-                    best_score, best_combo = avg_score, {"bg_kernel_frac": bgf, "clahe_clip": clip, "morph_kernel": mk}
-                    best_info = infos[0]
+    tuning_images = [(name, _downsample_for_tuning(raw)) for name, raw in sample_images]
+
+    combos = [(bgf, clip, mkf) for bgf in bg_kernel_fracs for clip in clahe_clips for mkf in morph_kernel_fracs]
+    best_score, best_combo_frac, best_info = None, None, None
+
+    for i, (bgf, clip, mkf) in enumerate(combos):
+        scores, infos = [], []
+        for _, small in tuning_images:
+            h, w = small.shape[:2]
+            mk_px = max(3, int(round(mkf * min(h, w))) | 1)
+            trial_params = dict(base_params, bg_kernel_frac=bgf, clahe_clip=clip, morph_kernel=mk_px)
+            res = process_image_array(small, trial_params)
+            s, info = score_segmentation(res["enhanced"], res["mask"])
+            scores.append(s)
+            infos.append(info)
+        avg_score = sum(scores) / len(scores)
+        if best_score is None or avg_score > best_score:
+            best_score = avg_score
+            best_combo_frac = {"bg_kernel_frac": bgf, "clahe_clip": clip, "morph_kernel_frac": mkf}
+            best_info = infos[0]
+        if progress_cb:
+            progress_cb((i + 1) / len(combos), i + 1, len(combos))
+
+    ref_h, ref_w = sample_images[0][1].shape[:2]
+    mk_full = max(3, int(round(best_combo_frac["morph_kernel_frac"] * min(ref_h, ref_w))) | 1)
+    mk_full = min(mk_full, 25)
+
+    best_combo = {
+        "bg_kernel_frac": best_combo_frac["bg_kernel_frac"],
+        "clahe_clip": best_combo_frac["clahe_clip"],
+        "morph_kernel": mk_full,
+    }
     return best_combo, best_score, best_info
 
 
@@ -254,8 +264,6 @@ with st.sidebar:
     for k, v in DEFAULTS.items():
         st.session_state.setdefault(k, v)
 
-    # Apply any auto-suggested values BEFORE the widgets below are instantiated —
-    # Streamlit forbids writing to session_state for a key after its widget exists.
     if "_apply_suggestion" in st.session_state:
         for k, v in st.session_state.pop("_apply_suggestion").items():
             st.session_state[k] = v
@@ -299,8 +307,16 @@ if auto_tune_clicked:
     if not sample_images:
         st.warning("Add at least one image first (upload one, or point to a folder) so there's something to tune on.")
     else:
-        with st.spinner(f"Trying parameter combinations on {len(sample_images)} sample image(s)..."):
-            best_combo, best_score, best_info = auto_suggest_params(sample_images, params)
+        progress_bar = st.progress(0.0)
+        status_text = st.empty()
+
+        def _report(frac, done, total):
+            progress_bar.progress(frac)
+            status_text.caption(f"Testing combination {done}/{total} (on a downsampled copy for speed)...")
+
+        best_combo, best_score, best_info = auto_suggest_params(sample_images, params, progress_cb=_report)
+        progress_bar.empty()
+        status_text.empty()
         st.session_state["_apply_suggestion"] = best_combo
         st.session_state["_auto_tune_info"] = best_info
         st.rerun()
@@ -312,7 +328,6 @@ if st.session_state.get("_auto_tune_info"):
         f"{info['components']} detected object(s). Check the live preview below and adjust further if needed."
     )
 
-# ----------------------------- Live preview (updates as you move sliders, no need to hit Run) -----------------------------
 st.subheader("🔍 Live Preview")
 if not sample_images:
     st.info("Upload an image (or set a valid local folder) to see a live preview of segmentation as you adjust settings.")
@@ -371,7 +386,6 @@ def render_results(results, preview_slots, excel_bytes, excel_name, zip_bytes=No
 
 
 if run_button:
-    # ---------------- Upload mode: everything stays in memory, zipped for download ----------------
     if source_mode == "Upload images":
         if not uploaded_files:
             st.error("Please upload at least one image.")
@@ -428,7 +442,6 @@ if run_button:
             zip_bytes=zip_buffer.getvalue(), zip_name=f"confluency_masks_overlays_{stamp}.zip",
         )
 
-    # ---------------- Local folder mode: original disk-based behavior ----------------
     else:
         if not folder or not os.path.isdir(folder):
             st.error("Please provide a valid, existing image folder path.")
