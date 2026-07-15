@@ -16,7 +16,13 @@ VALID_EXT = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
 
 # ----------------------------- Core image processing (pure, no I/O) -----------------------------
 
-def correct_background(gray, kernel_frac=0.05, cells_darker=True):
+def correct_background_morph(gray, kernel_frac=0.05, cells_darker=True):
+    """Remove uneven illumination using a large-kernel morphological
+    opening/closing (estimated background), then subtract it so cells always
+    end up as BRIGHT blobs on a near-zero background, regardless of whether
+    cells are naturally darker or brighter than the background.
+    kernel_frac scales the kernel size to image size so it works across
+    resolutions. Works well when the shading is fairly local/patchy."""
     h, w = gray.shape
     k = max(15, int(min(h, w) * kernel_frac))
     if k % 2 == 0:
@@ -31,7 +37,43 @@ def correct_background(gray, kernel_frac=0.05, cells_darker=True):
         corrected = cv2.subtract(gray, background)
 
     corrected = cv2.normalize(corrected, None, 0, 255, cv2.NORM_MINMAX)
-    return corrected.astype(np.uint8), background
+    return corrected.astype(np.uint8)
+
+
+def correct_background_flatfield(gray, sigma_frac=0.20, cells_darker=True):
+    """Removes broad, whole-image illumination gradients (vignetting, uneven
+    light source) via large-sigma Gaussian flat-field division: estimate a
+    smooth background with a very wide blur, then divide it out. This
+    handles gradients spanning most/all of the image far better than
+    morphological opening/closing, which is limited by its kernel size.
+    Better choice for sparse cultures where the shading pattern is broader
+    than any individual cell cluster."""
+    h, w = gray.shape
+    sigma = max(10.0, min(h, w) * sigma_frac)
+    bg = cv2.GaussianBlur(gray.astype(np.float32), (0, 0), sigmaX=sigma)
+    flat = (gray.astype(np.float32) / (bg + 1e-3)) * bg.mean()
+    flat = np.clip(flat, 0, 255).astype(np.uint8)
+    if not cells_darker:
+        flat = 255 - flat
+    corrected = cv2.normalize(flat, None, 0, 255, cv2.NORM_MINMAX)
+    return corrected.astype(np.uint8)
+
+
+def correct_background(gray, kernel_frac=0.05, cells_darker=True, method="morphological"):
+    if method == "flatfield":
+        return correct_background_flatfield(gray, sigma_frac=kernel_frac, cells_darker=cells_darker)
+    return correct_background_morph(gray, kernel_frac=kernel_frac, cells_darker=cells_darker)
+
+
+def denoise(gray, strength=0):
+    """Edge-preserving denoise to suppress fine sensor grain/JPEG texture
+    before contrast enhancement, without blurring away real cell edges the
+    way a plain Gaussian/median blur of the same strength would. strength=0
+    skips this step entirely."""
+    if strength <= 0:
+        return gray
+    d = 5 + 2 * strength
+    return cv2.bilateralFilter(gray, d=d, sigmaColor=10 * strength, sigmaSpace=d)
 
 
 def enhance_contrast(gray, clip_limit=2.0, tile_grid=8):
@@ -41,6 +83,10 @@ def enhance_contrast(gray, clip_limit=2.0, tile_grid=8):
 
 def segment_cells(gray, min_object_px=50, close_kernel=5, use_adaptive=False,
                    adaptive_block=51, adaptive_c=2):
+    """Threshold + clean up morphology. Input `gray` is assumed to already be
+    background-corrected such that cells are BRIGHT on a near-zero
+    background (see correct_background). Returns binary mask (0/255) where
+    255 = cell/foreground."""
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
     if use_adaptive:
@@ -81,10 +127,13 @@ def make_overlay(original_bgr, mask, color=(0, 255, 0), alpha=0.4):
 
 
 def process_image_array(raw, params):
+    """Runs the full pipeline on an already-decoded BGR image array."""
     gray = cv2.cvtColor(raw, cv2.COLOR_BGR2GRAY)
 
-    corrected, _ = correct_background(gray, kernel_frac=params["bg_kernel_frac"], cells_darker=params["invert"])
-    enhanced = enhance_contrast(corrected, clip_limit=params["clahe_clip"])
+    corrected = correct_background(gray, kernel_frac=params["bg_kernel_frac"], cells_darker=params["invert"],
+                                    method=params.get("bg_method", "morphological"))
+    denoised = denoise(corrected, strength=params.get("denoise_strength", 0))
+    enhanced = enhance_contrast(denoised, clip_limit=params["clahe_clip"])
 
     mask = segment_cells(
         enhanced,
@@ -117,6 +166,11 @@ def process_image_from_bytes(file_bytes, params):
 
 
 def score_segmentation(gray_enhanced, mask):
+    """Unsupervised quality proxy — there's no ground truth to compare against,
+    so this rewards a segmentation that (a) isn't degenerate (~0% or ~100%
+    foreground), (b) isn't fragmented into lots of tiny speckle objects, and
+    (c) has mask boundaries that sit on genuinely high-contrast edges in the
+    image rather than falling on flat, arbitrary regions. Higher is better."""
     total = mask.size
     fg = np.count_nonzero(mask)
     conf = 100.0 * fg / total
@@ -152,6 +206,7 @@ def _decode_path(path):
 
 
 def get_sample_images(source_mode, uploaded_files, folder, max_n=3):
+    """Returns up to max_n (name, raw_bgr_array) pairs for preview/auto-tune, without touching disk output."""
     samples = []
     if source_mode == "Upload images" and uploaded_files:
         for uf in uploaded_files[:max_n]:
@@ -179,25 +234,39 @@ def _downsample_for_tuning(raw, max_dim=AUTO_TUNE_MAX_DIM):
 
 
 def auto_suggest_params(sample_images, base_params, progress_cb=None):
-    """Runs entirely on downsampled copies (<= AUTO_TUNE_MAX_DIM per side) so it
-    stays fast even on full-resolution microscopy scans. The morphology kernel
+    """Small grid search over the parameters that most affect segmentation
+    quality, scored with score_segmentation() and averaged across sample
+    images. Keeps 'invert' and 'use_adaptive' as the user set them, since
+    those reflect known facts about the imaging modality, not something to
+    guess blindly.
+
+    Runs entirely on downsampled copies (<= AUTO_TUNE_MAX_DIM per side) so it
+    stays fast even on full-resolution microscopy scans — morphological
+    operations with large kernels get very slow on large images, and this
+    search tries many combinations per sample image. The morphology kernel
     size is searched as a fraction of image size, then translated back to an
-    absolute pixel size for the caller's actual (full-resolution) images."""
-    bg_kernel_fracs = [0.05, 0.08, 0.12, 0.18]
+    absolute pixel size for the caller's actual (full-resolution) images.
+    """
+    bg_methods = ["morphological", "flatfield"]
+    bg_kernel_fracs = [0.08, 0.15, 0.25, 0.35]
+    denoise_strengths = [0, 2]
     clahe_clips = [1.5, 2.0, 3.0]
-    morph_kernel_fracs = [0.010, 0.020, 0.035]
+    morph_kernel_fracs = [0.010, 0.020, 0.035]  # relative to min(h, w); translated to odd px at eval time
 
     tuning_images = [(name, _downsample_for_tuning(raw)) for name, raw in sample_images]
 
-    combos = [(bgf, clip, mkf) for bgf in bg_kernel_fracs for clip in clahe_clips for mkf in morph_kernel_fracs]
+    combos = [(bgm, bgf, dn, clip, mkf)
+              for bgm in bg_methods for bgf in bg_kernel_fracs for dn in denoise_strengths
+              for clip in clahe_clips for mkf in morph_kernel_fracs]
     best_score, best_combo_frac, best_info = None, None, None
 
-    for i, (bgf, clip, mkf) in enumerate(combos):
+    for i, (bgm, bgf, dn, clip, mkf) in enumerate(combos):
         scores, infos = [], []
         for _, small in tuning_images:
             h, w = small.shape[:2]
-            mk_px = max(3, int(round(mkf * min(h, w))) | 1)
-            trial_params = dict(base_params, bg_kernel_frac=bgf, clahe_clip=clip, morph_kernel=mk_px)
+            mk_px = max(3, int(round(mkf * min(h, w))) | 1)  # nearest odd, >= 3
+            trial_params = dict(base_params, bg_method=bgm, bg_kernel_frac=bgf, denoise_strength=dn,
+                                 clahe_clip=clip, morph_kernel=mk_px)
             res = process_image_array(small, trial_params)
             s, info = score_segmentation(res["enhanced"], res["mask"])
             scores.append(s)
@@ -205,17 +274,22 @@ def auto_suggest_params(sample_images, base_params, progress_cb=None):
         avg_score = sum(scores) / len(scores)
         if best_score is None or avg_score > best_score:
             best_score = avg_score
-            best_combo_frac = {"bg_kernel_frac": bgf, "clahe_clip": clip, "morph_kernel_frac": mkf}
+            best_combo_frac = {"bg_method": bgm, "bg_kernel_frac": bgf, "denoise_strength": dn,
+                                "clahe_clip": clip, "morph_kernel_frac": mkf}
             best_info = infos[0]
         if progress_cb:
             progress_cb((i + 1) / len(combos), i + 1, len(combos))
 
+    # Translate the winning morph_kernel_frac back to an absolute odd pixel size
+    # for the caller's actual (full-resolution) images.
     ref_h, ref_w = sample_images[0][1].shape[:2]
     mk_full = max(3, int(round(best_combo_frac["morph_kernel_frac"] * min(ref_h, ref_w))) | 1)
-    mk_full = min(mk_full, 25)
+    mk_full = min(mk_full, 25)  # keep within the slider's range
 
     best_combo = {
+        "bg_method": best_combo_frac["bg_method"],
         "bg_kernel_frac": best_combo_frac["bg_kernel_frac"],
+        "denoise_strength": best_combo_frac["denoise_strength"],
         "clahe_clip": best_combo_frac["clahe_clip"],
         "morph_kernel": mk_full,
     }
@@ -259,11 +333,14 @@ with st.sidebar:
 
     DEFAULTS = {
         "use_adaptive": False, "adaptive_block": 51, "adaptive_c": 2, "invert": True,
-        "bg_kernel_frac": 0.08, "clahe_clip": 2.0, "morph_kernel": 5, "min_object_px": 50,
+        "bg_method": "morphological", "bg_kernel_frac": 0.08, "denoise_strength": 0,
+        "clahe_clip": 2.0, "morph_kernel": 5, "min_object_px": 50,
     }
     for k, v in DEFAULTS.items():
         st.session_state.setdefault(k, v)
 
+    # Apply any auto-suggested values BEFORE the widgets below are instantiated —
+    # Streamlit forbids writing to session_state for a key after its widget exists.
     if "_apply_suggestion" in st.session_state:
         for k, v in st.session_state.pop("_apply_suggestion").items():
             st.session_state[k] = v
@@ -276,8 +353,15 @@ with st.sidebar:
     invert = st.checkbox("Cells are darker than background", key="invert",
                           help="Typical for brightfield: cells often appear darker than the empty well/background. Uncheck if cells appear brighter (e.g. some fluorescence images).")
 
-    bg_kernel_frac = st.slider("Background correction strength", 0.01, 0.30, step=0.01, key="bg_kernel_frac",
-                                help="Fraction of image size used for the background-estimation kernel. Should be larger than your biggest confluent cell patch — increase if large cell clusters are missed, decrease if fine detail is lost.")
+    bg_method = st.radio(
+        "Background correction method", ["morphological", "flatfield"], key="bg_method",
+        format_func=lambda m: "Morphological (confluent/patchy cultures)" if m == "morphological" else "Flat-field (uneven illumination, sparse cultures)",
+        help="Morphological: good when cells form solid patches. Flat-field: use this when there's a broad brightness gradient across the whole image (vignetting, off-center light) — very common with sparse, low-density cultures.",
+    )
+    bg_kernel_frac = st.slider("Background correction strength", 0.01, 0.50, step=0.01, key="bg_kernel_frac",
+                                help="For morphological: fraction of image size used for the background-estimation kernel — should exceed your biggest confluent cell patch. For flat-field: how wide the smoothing is — increase this if the background still looks unevenly lit after correction (try 0.20–0.35 for whole-image gradients).")
+    denoise_strength = st.slider("Denoise (before contrast enhancement)", 0, 5, step=1, key="denoise_strength",
+                                  help="Edge-preserving smoothing to suppress camera/JPEG grain before contrast enhancement amplifies it into false detections. Start at 0; increase if the mask looks speckled with tiny noise-sized objects rather than real cell shapes.")
     clahe_clip = st.slider("Contrast enhancement (CLAHE clip limit)", 0.5, 5.0, step=0.5, key="clahe_clip")
 
     morph_kernel = st.slider("Morphology kernel size (odd)", 3, 25, step=2, key="morph_kernel")
@@ -291,7 +375,9 @@ with st.sidebar:
     run_button = st.button("Run analysis", type="primary", use_container_width=True)
 
 params = {
+    "bg_method": bg_method,
     "bg_kernel_frac": bg_kernel_frac,
+    "denoise_strength": denoise_strength,
     "clahe_clip": clahe_clip,
     "min_object_px": min_object_px,
     "morph_kernel": morph_kernel,
@@ -328,6 +414,7 @@ if st.session_state.get("_auto_tune_info"):
         f"{info['components']} detected object(s). Check the live preview below and adjust further if needed."
     )
 
+# ----------------------------- Live preview (updates as you move sliders, no need to hit Run) -----------------------------
 st.subheader("🔍 Live Preview")
 if not sample_images:
     st.info("Upload an image (or set a valid local folder) to see a live preview of segmentation as you adjust settings.")
@@ -386,6 +473,7 @@ def render_results(results, preview_slots, excel_bytes, excel_name, zip_bytes=No
 
 
 if run_button:
+    # ---------------- Upload mode: everything stays in memory, zipped for download ----------------
     if source_mode == "Upload images":
         if not uploaded_files:
             st.error("Please upload at least one image.")
@@ -442,6 +530,7 @@ if run_button:
             zip_bytes=zip_buffer.getvalue(), zip_name=f"confluency_masks_overlays_{stamp}.zip",
         )
 
+    # ---------------- Local folder mode: original disk-based behavior ----------------
     else:
         if not folder or not os.path.isdir(folder):
             st.error("Please provide a valid, existing image folder path.")
