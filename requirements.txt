@@ -1,0 +1,19 @@
+# Cell Confluency Analyzer - dependencies
+#
+# Core app (Classical engine works with just these):
+streamlit>=1.36
+numpy>=1.26
+pandas>=2.2
+opencv-python-headless>=4.9
+openpyxl>=3.1
+
+# AI engine (Cellpose). Pinned to <4 on purpose: cellpose 4.x ("Cellpose-SAM")
+# uses a ~1.2 GB model that is very slow on CPU-only machines / Streamlit Cloud.
+# cellpose 3.x uses the small, fast `cyto3` model instead.
+cellpose>=3.0,<4.0
+
+# torch is required by cellpose. On CPU-only hosts (incl. Streamlit Community
+# Cloud) install the CPU wheel. If deploying there, you can instead add this to
+# a packages/requirements pin, or use the CPU index:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch>=2.0
