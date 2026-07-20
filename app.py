@@ -27,8 +27,11 @@ same outputs, so you can switch between them freely.
 
 import io
 import os
+import gc
 import glob
+import shutil
 import zipfile
+import tempfile
 from datetime import datetime
 
 import cv2
@@ -98,13 +101,14 @@ def _to_gray_bgr(img):
     return gray, bgr
 
 
-@st.cache_data(show_spinner=False)
+# NOTE: these are deliberately NOT cached. @st.cache_data would keep every
+# decoded full-resolution image (~30 MB each) in RAM for the whole session,
+# which is what made large batches (>20 images) run out of memory and crash.
 def load_from_bytes(file_bytes):
     img = cv2.imdecode(np.frombuffer(file_bytes, np.uint8), cv2.IMREAD_UNCHANGED)
     return _to_gray_bgr(img)
 
 
-@st.cache_data(show_spinner=False)
 def load_from_path(path):
     img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
     return _to_gray_bgr(img)
@@ -272,12 +276,15 @@ def make_overlay(bgr, mask, labels=None, alpha=0.4):
     return blended
 
 
-def process(gray, bgr, params):
+def process(gray, bgr, params, want_overlay=True, want_enhanced=True,
+            want_labels=True):
     """Run the selected engine at the working resolution, then scale results
     back to full resolution for display / export. Returns a result dict.
 
     Confluency (an area ratio) is scale-invariant, so downsampling for speed
-    does not bias it."""
+    does not bias it. The want_* flags let batch runs skip building large arrays
+    (overlays, enhanced previews, full-res label maps) they don't need, which
+    keeps memory low on big folders."""
     work, s = downsample(gray, params["work_dim"])
 
     if params["engine"] == "Cellpose (AI)":
@@ -288,13 +295,13 @@ def process(gray, bgr, params):
             cellprob_threshold=params["cellprob_threshold"],
             do_flatten=params["do_flatten"], do_enhance=params["do_enhance"],
             min_object_px=params["min_object_px"], drop_saturated=params["drop_saturated"])
-        enhanced_view = preprocess(work, params["do_flatten"], params["do_enhance"])
+        enhanced_view = preprocess(work, params["do_flatten"], params["do_enhance"]) if want_enhanced else None
     else:
         mask_w, labels_w = segment_classical(
             work, sensitivity=params["sensitivity"],
             min_object_px=params["min_object_px"],
             drop_saturated=params["drop_saturated"])
-        enhanced_view = flatten_illumination(work)
+        enhanced_view = flatten_illumination(work) if want_enhanced else None
 
     confluency = 100.0 * np.count_nonzero(mask_w) / mask_w.size
     cell_count = int(labels_w.max())
@@ -303,11 +310,13 @@ def process(gray, bgr, params):
     fg_work = int(np.count_nonzero(mask_w))
     mean_area_orig = (fg_work / max(cell_count, 1)) / (s * s) if cell_count else 0.0
 
-    # scale mask/labels back to full resolution for overlay + export
+    # scale results back to full resolution for overlay + export
     h, w = gray.shape
     mask_full = cv2.resize(mask_w, (w, h), interpolation=cv2.INTER_NEAREST)
-    labels_full = cv2.resize(labels_w, (w, h), interpolation=cv2.INTER_NEAREST)
-    overlay = make_overlay(bgr, mask_full, labels_full)
+    labels_full = None
+    if want_labels or want_overlay:
+        labels_full = cv2.resize(labels_w, (w, h), interpolation=cv2.INTER_NEAREST)
+    overlay = make_overlay(bgr, mask_full, labels_full) if want_overlay else None
 
     return {
         "confluency": confluency,
@@ -365,15 +374,17 @@ def build_excel(rows, params, engine_label):
 def add_pngs_to_zip(zf, fname, res, export_binary=True, export_overlay=True,
                     export_labels=False):
     base = os.path.splitext(fname)[0]
-    if export_binary:
+    if export_binary and res.get("mask") is not None:
         ok, png = cv2.imencode(".png", res["mask"])
         if ok:
             zf.writestr(f"masks/{base}_mask.png", png.tobytes())
-    if export_overlay:
-        ok, png = cv2.imencode(".png", res["overlay"])
+    if export_overlay and res.get("overlay") is not None:
+        # overlays are QC visuals, so JPEG (much smaller than PNG) is fine and
+        # keeps the archive from blowing up on large batches.
+        ok, jpg = cv2.imencode(".jpg", res["overlay"], [cv2.IMWRITE_JPEG_QUALITY, 85])
         if ok:
-            zf.writestr(f"overlays/{base}_overlay.png", png.tobytes())
-    if export_labels:
+            zf.writestr(f"overlays/{base}_overlay.jpg", jpg.tobytes())
+    if export_labels and res.get("labels") is not None:
         # 16-bit instance-label PNG: each cell has a unique id (raw data)
         lab16 = np.clip(res["labels"], 0, 65535).astype(np.uint16)
         ok, png = cv2.imencode(".png", lab16)
@@ -507,50 +518,53 @@ engine_label = ("Cellpose cyto3 (AI)" if engine == "Cellpose (AI)"
                 else "Classical edge+texture")
 
 
-# ---- gather a few samples for the live preview ----
-def get_samples(max_n=6):
-    out = []
+# ---- live-preview helpers: list names cheaply, decode only the chosen image ----
+def preview_names():
     if source_mode == "Upload images" and uploaded_files:
-        for uf in uploaded_files[:max_n]:
-            g, b = load_from_bytes(uf.getvalue())
-            if g is not None:
-                out.append((uf.name, g, b))
-    elif source_mode == "Local folder path" and folder and os.path.isdir(folder):
-        paths = sorted(p for p in glob.glob(os.path.join(folder, "*"))
-                       if p.lower().endswith(VALID_EXT))
-        for p in paths[:max_n]:
-            g, b = load_from_path(p)
-            if g is not None:
-                out.append((os.path.basename(p), g, b))
-    return out
+        return [uf.name for uf in uploaded_files]
+    if source_mode == "Local folder path" and folder and os.path.isdir(folder):
+        return sorted(os.path.basename(p) for p in glob.glob(os.path.join(folder, "*"))
+                      if p.lower().endswith(VALID_EXT))
+    return []
 
 
-samples = get_samples()
+def load_preview(name):
+    if source_mode == "Upload images" and uploaded_files:
+        uf = next((u for u in uploaded_files if u.name == name), None)
+        return load_from_bytes(uf.getvalue()) if uf else (None, None)
+    if source_mode == "Local folder path" and folder:
+        return load_from_path(os.path.join(folder, name))
+    return None, None
+
+
+names = preview_names()
 
 # =============================================================================
 # Live preview
 # =============================================================================
 st.subheader("🔍 Live preview")
-if not samples:
+if not names:
     st.info("Add images in the sidebar to preview segmentation before running the full batch.")
 else:
-    names = [n for n, _, _ in samples]
     choice = st.selectbox("Preview image", names, key="preview_choice")
-    gray, bgr = next((g, b) for n, g, b in samples if n == choice)
+    gray, bgr = load_preview(choice)
 
-    if engine == "Cellpose (AI)":
+    if gray is None:
+        st.warning(f"Couldn't read {choice} for preview.")
+        res = None
+    elif engine == "Cellpose (AI)":
         st.caption("Cellpose preview runs the AI model on one image (a few seconds). "
                    "Click to refresh after changing settings.")
         do_prev = st.button("🔄 Update Cellpose preview")
         sig = str(params) + choice
         if do_prev or st.session_state.get("_prev_sig") == sig:
             with st.spinner("Segmenting preview with Cellpose..."):
-                res = process(gray, bgr, params)
+                res = process(gray, bgr, params, want_labels=False)
             st.session_state["_prev_sig"] = sig
             st.session_state["_prev_res"] = res
         res = st.session_state.get("_prev_res") if st.session_state.get("_prev_sig") == sig else None
     else:
-        res = process(gray, bgr, params)
+        res = process(gray, bgr, params, want_labels=False)
 
     if res is not None:
         c = st.columns(4)
@@ -568,117 +582,192 @@ st.divider()
 # =============================================================================
 # Batch run
 # =============================================================================
-def iter_inputs():
+MAX_THUMBS = 9          # how many overlay thumbnails to show after a run
+THUMB_MAX_DIM = 500     # px, long edge of each thumbnail
+
+
+def input_specs():
+    """List of (name, kind, ref) WITHOUT decoding images or reading bytes, so a
+    big folder costs almost nothing until each image is processed in turn."""
     if source_mode == "Upload images":
-        for uf in uploaded_files:
-            yield uf.name, ("bytes", uf.getvalue())
-    else:
-        for p in sorted(glob.glob(os.path.join(folder, "*"))):
-            if p.lower().endswith(VALID_EXT):
-                yield os.path.basename(p), ("path", p)
+        return [(uf.name, "upload", uf) for uf in (uploaded_files or [])]
+    if source_mode == "Local folder path" and folder and os.path.isdir(folder):
+        return [(os.path.basename(p), "path", p)
+                for p in sorted(glob.glob(os.path.join(folder, "*")))
+                if p.lower().endswith(VALID_EXT)]
+    return []
+
+
+def make_thumb(overlay_bgr, conf):
+    h, w = overlay_bgr.shape[:2]
+    sc = min(1.0, THUMB_MAX_DIM / max(h, w))
+    small = cv2.resize(overlay_bgr, (max(1, int(w * sc)), max(1, int(h * sc))),
+                       interpolation=cv2.INTER_AREA) if sc < 1.0 else overlay_bgr
+    ok, jpg = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    return jpg.tobytes() if ok else None
+
+
+def _drop_old_results():
+    """Delete the temp zip from a previous run so they don't accumulate."""
+    old = st.session_state.get("results", {})
+    p = old.get("zip_path")
+    if p and os.path.exists(p):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
 
 
 if run_button:
-    have_input = (source_mode == "Upload images" and uploaded_files) or \
-                 (source_mode == "Local folder path" and folder and os.path.isdir(folder))
-    if not have_input:
-        st.error("Add images (upload some, or point to a valid folder) before running.")
+    specs = input_specs()
+    if not specs:
+        if source_mode == "Local folder path" and folder and not os.path.isdir(folder):
+            st.error("That folder path doesn't exist.")
+        else:
+            st.warning("Add images (upload some, or point to a folder with "
+                       "png/jpg/jpeg/tif/tiff/bmp) before running.")
         st.stop()
 
-    inputs = list(iter_inputs())
-    if not inputs:
-        st.warning("No supported images found (png/jpg/jpeg/tif/tiff/bmp).")
-        st.stop()
-
-    st.info(f"Processing {len(inputs)} image(s) with {engine_label}...")
+    _drop_old_results()
+    total = len(specs)
+    st.info(f"Processing {total} image(s) with {engine_label}...")
     progress = st.progress(0.0)
     status = st.empty()
-    rows, previews = [], []
+    rows, thumbs = [], []
 
-    zip_buf = io.BytesIO()
-    zf = zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED)
+    # Stream results straight to a zip on disk (not RAM): the archive can grow to
+    # hundreds of MB on big batches without ever being held in memory at once.
+    zip_fd, zip_path = tempfile.mkstemp(suffix=".zip", prefix="confluency_")
+    os.close(zip_fd)
 
-    for i, (fname, (kind, payload)) in enumerate(inputs):
-        status.caption(f"{i + 1}/{len(inputs)} · {fname}")
-        try:
-            gray, bgr = (load_from_bytes(payload) if kind == "bytes"
-                         else load_from_path(payload))
-            if gray is None:
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for i, (fname, kind, ref) in enumerate(specs):
+            status.caption(f"{i + 1}/{total} · {fname}")
+            gray = bgr = res = None
+            try:
+                gray, bgr = (load_from_bytes(ref.getvalue()) if kind == "upload"
+                             else load_from_path(ref))
+                if gray is None:
+                    rows.append({"filename": fname, "confluency_percent": None,
+                                 "cell_count": None, "mean_cell_area_px": None,
+                                 "status": "unreadable"})
+                else:
+                    want_overlay = export_overlay or len(thumbs) < MAX_THUMBS
+                    res = process(gray, bgr, params, want_overlay=want_overlay,
+                                  want_enhanced=False, want_labels=export_labels)
+                    rows.append({
+                        "filename": fname,
+                        "confluency_percent": round(res["confluency"], 2),
+                        "cell_count": res["cell_count"],
+                        "mean_cell_area_px": round(res["mean_cell_area_px"], 1),
+                        "status": "ok",
+                    })
+                    add_pngs_to_zip(zf, fname, res, export_binary, export_overlay, export_labels)
+                    if len(thumbs) < MAX_THUMBS and res.get("overlay") is not None:
+                        th = make_thumb(res["overlay"], res["confluency"])
+                        if th:
+                            thumbs.append((fname, th, res["confluency"]))
+            except Exception as e:
                 rows.append({"filename": fname, "confluency_percent": None,
                              "cell_count": None, "mean_cell_area_px": None,
-                             "status": "unreadable"})
-            else:
-                res = process(gray, bgr, params)
-                rows.append({
-                    "filename": fname,
-                    "confluency_percent": round(res["confluency"], 2),
-                    "cell_count": res["cell_count"],
-                    "mean_cell_area_px": round(res["mean_cell_area_px"], 1),
-                    "status": "ok",
-                })
-                add_pngs_to_zip(zf, fname, res, export_binary, export_overlay, export_labels)
-                if len(previews) < 12:
-                    previews.append((fname, res["overlay"], res["confluency"]))
-        except Exception as e:
-            rows.append({"filename": fname, "confluency_percent": None,
-                         "cell_count": None, "mean_cell_area_px": None,
-                         "status": f"error: {e}"})
-        progress.progress((i + 1) / len(inputs))
+                             "status": f"error: {e}"})
+            finally:
+                del gray, bgr, res
+                if (i + 1) % 5 == 0:
+                    gc.collect()
+            progress.progress((i + 1) / total)
+
+        excel_bytes = build_excel(rows, params, engine_label)
+        zf.writestr("confluency_results.xlsx", excel_bytes)
 
     status.empty()
-
-    excel_bytes = build_excel(rows, params, engine_label)
-    zf.writestr("confluency_results.xlsx", excel_bytes)
-    zf.close()
+    gc.collect()
 
     n_ok = sum(1 for r in rows if r["status"] == "ok")
-    if n_ok == 0:
-        st.error("No images could be processed.")
-        st.dataframe(pd.DataFrame(rows), use_container_width=True)
-        st.stop()
-
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # In folder mode, copy outputs next to the images so nothing has to be
+    # downloaded through the browser at all.
+    saved_dir = None
+    if source_mode == "Local folder path" and n_ok > 0:
+        try:
+            out_dir = output_folder.strip() or os.path.join(folder, "confluency_output")
+            os.makedirs(out_dir, exist_ok=True)
+            with open(os.path.join(out_dir, f"confluency_results_{stamp}.xlsx"), "wb") as f:
+                f.write(excel_bytes)
+            shutil.copyfile(zip_path, os.path.join(out_dir, f"confluency_masks_{stamp}.zip"))
+            saved_dir = out_dir
+        except OSError as e:
+            st.warning(f"Couldn't write to the output folder: {e}")
+
+    st.session_state["results"] = {
+        "rows": rows, "stamp": stamp, "excel_bytes": excel_bytes,
+        "zip_path": zip_path, "zip_size": os.path.getsize(zip_path),
+        "thumbs": thumbs, "engine_label": engine_label, "n_ok": n_ok,
+        "saved_dir": saved_dir,
+    }
+
+
+# =============================================================================
+# Results (rendered from session_state so downloads survive Streamlit reruns)
+# =============================================================================
+R = st.session_state.get("results")
+if R:
+    rows = R["rows"]
     df = pd.DataFrame(rows)
     conf = pd.to_numeric(df["confluency_percent"], errors="coerce").dropna()
 
-    st.success(f"Done — {n_ok}/{len(rows)} images processed. "
-               f"Mean confluency {conf.mean():.1f}% (range {conf.min():.1f}–{conf.max():.1f}%).")
+    if R["n_ok"] == 0:
+        st.error("No images could be processed. See details below.")
+        st.dataframe(df, use_container_width=True)
+    else:
+        st.success(f"Done — {R['n_ok']}/{len(rows)} images processed with "
+                   f"{R['engine_label']}. Mean confluency {conf.mean():.1f}% "
+                   f"(range {conf.min():.1f}–{conf.max():.1f}%).")
 
-    m = st.columns(4)
-    m[0].metric("Images", n_ok)
-    m[1].metric("Mean confluency", f"{conf.mean():.1f}%")
-    m[2].metric("Median", f"{conf.median():.1f}%")
-    m[3].metric("Std dev", f"{conf.std():.1f}%" if len(conf) > 1 else "—")
+        m = st.columns(4)
+        m[0].metric("Images", R["n_ok"])
+        m[1].metric("Mean confluency", f"{conf.mean():.1f}%")
+        m[2].metric("Median", f"{conf.median():.1f}%")
+        m[3].metric("Std dev", f"{conf.std():.1f}%" if len(conf) > 1 else "—")
 
-    st.subheader("Results")
-    st.dataframe(df, use_container_width=True)
+        st.subheader("Results")
+        st.dataframe(df, use_container_width=True)
 
-    dl = st.columns(2)
-    dl[0].download_button("⬇ Download Excel results", excel_bytes,
-                          file_name=f"confluency_results_{stamp}.xlsx",
-                          mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                          use_container_width=True)
-    dl[1].download_button("⬇ Download masks + overlays (.zip)", zip_buf.getvalue(),
-                          file_name=f"confluency_masks_{stamp}.zip",
-                          mime="application/zip", use_container_width=True)
+        stamp = R["stamp"]
+        dl = st.columns(2)
+        dl[0].download_button(
+            "⬇ Download Excel results", R["excel_bytes"],
+            file_name=f"confluency_results_{stamp}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True)
 
-    # save to disk too, in local-folder mode
-    if source_mode == "Local folder path":
-        out_dir = output_folder.strip() or os.path.join(folder, "confluency_output")
-        os.makedirs(out_dir, exist_ok=True)
-        with open(os.path.join(out_dir, f"confluency_results_{stamp}.xlsx"), "wb") as f:
-            f.write(excel_bytes)
-        with open(os.path.join(out_dir, f"confluency_masks_{stamp}.zip"), "wb") as f:
-            f.write(zip_buf.getvalue())
-        st.caption(f"Also saved to: {out_dir}")
+        zip_path = R.get("zip_path")
+        if zip_path and os.path.exists(zip_path):
+            size_mb = R["zip_size"] / 1e6
+            with open(zip_path, "rb") as f:
+                dl[1].download_button(
+                    f"⬇ Download masks + overlays (.zip · {size_mb:.0f} MB)", f.read(),
+                    file_name=f"confluency_masks_{stamp}.zip",
+                    mime="application/zip", use_container_width=True)
+        else:
+            dl[1].info("Mask ZIP no longer available — re-run to regenerate.")
 
-    if previews:
-        st.subheader("Overlays (green = detected cells, red = outlines)")
-        per_row = 3
-        for i in range(0, len(previews), per_row):
-            cols = st.columns(per_row)
-            for col, (fn, ov, cf) in zip(cols, previews[i:i + per_row]):
-                col.image(cv2.cvtColor(ov, cv2.COLOR_BGR2RGB),
-                          caption=f"{fn} — {cf:.1f}%", use_container_width=True)
+        if R.get("saved_dir"):
+            st.caption(f"Also saved to: {R['saved_dir']}")
+
+        if R["thumbs"]:
+            st.subheader("Overlays (green = detected cells, red = outlines)")
+            shown = len(R["thumbs"])
+            if R["n_ok"] > shown:
+                st.caption(f"Showing the first {shown} of {R['n_ok']} — all overlays "
+                           "are in the ZIP.")
+            per_row = 3
+            for i in range(0, len(R["thumbs"]), per_row):
+                cols = st.columns(per_row)
+                for col, (fn, jpg, cf) in zip(cols, R["thumbs"][i:i + per_row]):
+                    arr = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
+                    col.image(cv2.cvtColor(arr, cv2.COLOR_BGR2RGB),
+                              caption=f"{fn} — {cf:.1f}%", use_container_width=True)
 else:
     st.info("Set up your images and settings in the sidebar, then click **Run analysis**.")
